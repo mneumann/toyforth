@@ -13,13 +13,11 @@ enum CompiledInstruction {
     CALL,
     JUMP,
     RET,
-
     NOP,
 
     // Used to push data onto the data stack
     IMM(usize),
     PRINT,
-    EVAL,
 }
 
 struct Word {
@@ -39,9 +37,6 @@ struct VM {
     call_stack: Vec<usize>,
     instruction_memory: Vec<CompiledInstruction>,
     instruction_pointer: usize,
-    word_dictionary_start: usize,
-    word_dictionary_current: usize,
-    interpreter_next_ins: usize,
     compile_mode: CompileMode,
     words: Vec<Word>,
     in_comment: bool,
@@ -50,7 +45,6 @@ struct VM {
 #[derive(Debug, Copy, Clone)]
 enum VMErr {
     StackUnderflow,
-    Eval,
 }
 
 impl VM {
@@ -58,13 +52,8 @@ impl VM {
         VM {
             data_stack: vec![],
             call_stack: vec![],
-            instruction_memory: (0..1024).map(|_| CompiledInstruction::NOP).collect(),
-            instruction_pointer: 1024,
-            // This is from where the dictionary is build
-            word_dictionary_start: 256,
-            word_dictionary_current: 256,
-            // this is where we put code when we directly execute code.
-            interpreter_next_ins: 0,
+            instruction_memory: Vec::new(),
+            instruction_pointer: 0,
             compile_mode: CompileMode::TopLevel,
             in_comment: false,
             words: vec![
@@ -172,7 +161,6 @@ impl VM {
                 let tos = self.pop_data_stack()?;
                 print!(" {}", tos);
             }
-            CompiledInstruction::EVAL => return Err(VMErr::Eval),
         }
 
         Ok(())
@@ -192,19 +180,35 @@ impl VM {
         }
     }
 
+    // Places `ins_seq` somewhere in the instruction_memory and execute it.
+    pub fn run(&mut self, ins_seq: &[CompiledInstruction]) -> Result<(), VMErr> {
+        self.instruction_pointer = self.instruction_memory.len();
+        let old_imem_len = self.instruction_memory.len();
+        for &ins in ins_seq {
+            self.instruction_memory.push(ins);
+        }
 
-    fn run(&mut self) -> Result<(), VMErr> {
         loop {
+            if self.instruction_pointer == self.instruction_memory.len() {
+                // restore original instruction memory
+                self.instruction_memory.truncate(old_imem_len);
+                return Ok(());
+            }
+
             let ins = *self.instruction_memory
                 .get(self.instruction_pointer)
-                .unwrap();
+                .unwrap(); // XXX
             self.instruction_pointer += 1;
 
-            self.exec_ins(ins)?;
+            if let Err(err) = self.exec_ins(ins) {
+                // restore original instruction memory
+                self.instruction_memory.truncate(old_imem_len);
+                return Err(err);
+            }
         }
     }
 
-    fn in_compile_mode(&self) -> bool {
+    pub fn in_compile_mode(&self) -> bool {
         match self.compile_mode {
             CompileMode::TopLevel => false,
             CompileMode::Definition => true,
@@ -212,17 +216,17 @@ impl VM {
         }
     }
 
-    fn eval_line(&mut self, line: &str) {
-        // reset
-        self.interpreter_next_ins = 0;
-
+    // Compiles `line` into a sequence of instructions which is appended to `ins_seq`.
+    // As a side-effect, when a ":" definition is occured, this will add a
+    // word to the dictionary.
+    pub fn compile_line(&mut self, line: &str, ins_seq: &mut Vec<CompiledInstruction>) {
         let mut remainder: &str = line;
 
         loop {
             match remainder.find(char::is_whitespace) {
                 None => {
                     if remainder.len() > 0 {
-                        self.eval_token(remainder);
+                        self.compile_token(remainder, ins_seq);
                     }
                     break;
                 }
@@ -230,7 +234,7 @@ impl VM {
                     if pos > 0 {
                         // if pos == 0, then we found a whitespace at the beginning
                         let (token, rest) = remainder.split_at(pos);
-                        self.eval_token(token);
+                        self.compile_token(token, ins_seq);
                         remainder = rest;
                     } else {
                         let (_token, rest) = remainder.split_at(1);
@@ -239,12 +243,9 @@ impl VM {
                 }
             }
         }
-
-        self.push_ins(CompiledInstruction::EVAL);
-        self.instruction_pointer = 0;
     }
 
-    fn eval_token(&mut self, token: &str) {
+    fn compile_token(&mut self, token: &str, ins_seq: &mut Vec<CompiledInstruction>) {
         // process comments
         if self.in_comment {
             if token == ")" {
@@ -267,9 +268,8 @@ impl VM {
                         self.compile_mode = CompileMode::Definition;
                     }
                     _ => {
-                        let ins_seq = self.token_to_instruction_seq(token);
-                        for ins in ins_seq {
-                            self.push_ins(ins);
+                        for ins in self.token_to_instruction_seq(token) {
+                            ins_seq.push(ins);
                         }
                     }
                 }
@@ -278,16 +278,15 @@ impl VM {
                 self.words.push(Word {
                     name: token.into(),
                     inline_iseq: vec![
-                        CompiledInstruction::IMM(self.word_dictionary_current),
+                        CompiledInstruction::IMM(self.instruction_memory.len()),
                         CompiledInstruction::CALL,
                     ],
                 });
                 self.compile_mode = CompileMode::DefinitionBody;
             }
             CompileMode::DefinitionBody => {
-                let ins_seq = self.token_to_instruction_seq(token);
-                for ins in ins_seq {
-                    self.push_ins_word(ins);
+                for ins in self.token_to_instruction_seq(token) {
+                    self.instruction_memory.push(ins);
                 }
                 if token == ";" {
                     // ends a definition
@@ -295,17 +294,6 @@ impl VM {
                 }
             }
         }
-    }
-
-    fn push_ins(&mut self, ins: CompiledInstruction) {
-        assert!(self.interpreter_next_ins < self.word_dictionary_start);
-        self.instruction_memory[self.interpreter_next_ins] = ins;
-        self.interpreter_next_ins += 1;
-    }
-
-    fn push_ins_word(&mut self, ins: CompiledInstruction) {
-        self.instruction_memory[self.word_dictionary_current] = ins;
-        self.word_dictionary_current += 1;
     }
 
     fn token_to_instruction_seq(&self, token: &str) -> Vec<CompiledInstruction> {
@@ -340,21 +328,22 @@ fn read_line() -> String {
 }
 
 fn main() {
-    println!("ToyForth started");
+    println!("MiniForth started");
     let mut vm = VM::new();
+    let mut ins_seq = Vec::new();
     loop {
         let line = read_line();
-        vm.eval_line(&line);
-        match vm.run() {
+        ins_seq.clear();
+        vm.compile_line(&line, &mut ins_seq);
+
+        match vm.run(&ins_seq) {
             Ok(()) => {
-            }
-            Err(VMErr::Eval) => {
-                // return to eval loop
             }
             Err(err) => {
                 println!("Error: {:?}", err);
             }
         }
+
         if vm.in_compile_mode() {
             println!(" compiled");
         } else {
