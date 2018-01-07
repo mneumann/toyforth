@@ -337,7 +337,7 @@ fn read_line() -> String {
 }
 
 fn main() {
-    println!("MiniForth started");
+    println!("ToyForth started");
     let mut vm = VM::new();
     let mut ins_seq = Vec::new();
     loop {
