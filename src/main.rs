@@ -42,9 +42,10 @@ struct VM {
     in_comment: bool,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Clone)]
 enum VMErr {
     StackUnderflow,
+    InvalidToken(String),
 }
 
 impl VM {
@@ -219,22 +220,26 @@ impl VM {
     // Compiles `line` into a sequence of instructions which is appended to `ins_seq`.
     // As a side-effect, when a ":" definition is occured, this will add a
     // word to the dictionary.
-    pub fn compile_line(&mut self, line: &str, ins_seq: &mut Vec<CompiledInstruction>) {
+    pub fn compile_line(
+        &mut self,
+        line: &str,
+        ins_seq: &mut Vec<CompiledInstruction>,
+    ) -> Result<(), VMErr> {
         let mut remainder: &str = line;
 
         loop {
             match remainder.find(char::is_whitespace) {
                 None => {
                     if remainder.len() > 0 {
-                        self.compile_token(remainder, ins_seq);
+                        let _ = self.compile_token(remainder, ins_seq)?;
                     }
-                    break;
+                    return Ok(());
                 }
                 Some(pos) => {
                     if pos > 0 {
                         // if pos == 0, then we found a whitespace at the beginning
                         let (token, rest) = remainder.split_at(pos);
-                        self.compile_token(token, ins_seq);
+                        let _ = self.compile_token(token, ins_seq)?;
                         remainder = rest;
                     } else {
                         let (_token, rest) = remainder.split_at(1);
@@ -245,17 +250,21 @@ impl VM {
         }
     }
 
-    fn compile_token(&mut self, token: &str, ins_seq: &mut Vec<CompiledInstruction>) {
+    fn compile_token(
+        &mut self,
+        token: &str,
+        ins_seq: &mut Vec<CompiledInstruction>,
+    ) -> Result<(), VMErr> {
         // process comments
         if self.in_comment {
             if token == ")" {
                 self.in_comment = false;
             }
-            return;
+            return Ok(());
         } else {
             if token == "(" {
                 self.in_comment = true;
-                return;
+                return Ok(());
             }
         }
 
@@ -268,7 +277,7 @@ impl VM {
                         self.compile_mode = CompileMode::Definition;
                     }
                     _ => {
-                        for ins in self.token_to_instruction_seq(token) {
+                        for ins in self.token_to_instruction_seq(token)? {
                             ins_seq.push(ins);
                         }
                     }
@@ -285,7 +294,7 @@ impl VM {
                 self.compile_mode = CompileMode::DefinitionBody;
             }
             CompileMode::DefinitionBody => {
-                for ins in self.token_to_instruction_seq(token) {
+                for ins in self.token_to_instruction_seq(token)? {
                     self.instruction_memory.push(ins);
                 }
                 if token == ";" {
@@ -294,24 +303,24 @@ impl VM {
                 }
             }
         }
+        Ok(())
     }
 
-    fn token_to_instruction_seq(&self, token: &str) -> Vec<CompiledInstruction> {
+    fn token_to_instruction_seq(&self, token: &str) -> Result<Vec<CompiledInstruction>, VMErr> {
         match self.lookup_word(token) {
             None => {
                 // it's not a word. it might be a number, or an invalid token
                 match usize::from_str(token) {
                     Ok(num) => {
-                        return vec![CompiledInstruction::IMM(num)];
+                        return Ok(vec![CompiledInstruction::IMM(num)]);
                     }
                     Err(_) => {
-                        eprintln!("Invalid token: {}", token);
-                        return vec![];
+                        return Err(VMErr::InvalidToken(token.into()));
                     }
                 }
             }
             Some(word) => {
-                return word.inline_iseq.clone();
+                return Ok(word.inline_iseq.clone());
             }
         }
     }
@@ -334,20 +343,24 @@ fn main() {
     loop {
         let line = read_line();
         ins_seq.clear();
-        vm.compile_line(&line, &mut ins_seq);
-
-        match vm.run(&ins_seq) {
+        match vm.compile_line(&line, &mut ins_seq) {
             Ok(()) => {
+                match vm.run(&ins_seq) {
+                    Ok(()) => {
+                        if vm.in_compile_mode() {
+                            println!(" compiled");
+                        } else {
+                            println!(" ok");
+                        }
+                    }
+                    Err(err) => {
+                        println!("Error: {:?}", err);
+                    }
+                }
             }
             Err(err) => {
                 println!("Error: {:?}", err);
             }
-        }
-
-        if vm.in_compile_mode() {
-            println!(" compiled");
-        } else {
-            println!(" ok");
         }
     }
 }
